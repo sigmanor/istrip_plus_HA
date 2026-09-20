@@ -49,3 +49,7 @@ EFFECT_DEFAULT_SPEEDS: dict[str, int] = {
     "7-Color Flash": 100,
     "3-Color Flash": 100,
 }
+
+KEEPALIVE_INTERVAL = 10
+RECONNECT_TICKS = 3
+DISCONNECT_TIMEOUT = 5

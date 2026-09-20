@@ -52,6 +52,12 @@ class PayloadGenerator:
 
     GROUP_ID = 1
 
+    # All three colour channels at zero reads as a hardware power-off: the
+    # lamp cuts its own controller and neither BLE nor the IR remote can
+    # wake it again. "Off" is therefore a near-dark frame, not a dark one.
+    OFF_RGB = (255, 104, 242)
+    OFF_BRIGHTNESS = 1
+
     EFFECT_MODES: dict[str, int] = {  # noqa: RUF012
         "3-Color Breathing": 6,
         "3-Color Fade": 2,
@@ -109,14 +115,14 @@ class PayloadGenerator:
         payload[11] = speed
         return self._encrypt_and_format(payload)
 
-    def send_led_off(self, brightness: int = 0, speed: int = 100) -> str:
+    def send_led_off(self, brightness: int = OFF_BRIGHTNESS, speed: int = 100) -> str:
         """Generate the payload to turn off the LED strip."""
         payload = bytearray(16)
         payload[0:4] = self.HEADER
         payload[4] = CommandType.RGB
         payload[5] = self.GROUP_ID
-        payload[6:9] = b"\x00\x00\x00"
-        payload[9] = 0x00
+        payload[6] = 0x00
+        payload[7:10] = bytes(self.OFF_RGB)
         payload[10] = brightness
         payload[11] = speed
 
@@ -189,7 +195,7 @@ class PayloadGenerator:
         brightness = decrypted_payload[10]
         speed = decrypted_payload[11]
 
-        is_on = not (red == 0 and green == 0 and blue == 0 and mode == 0)
+        is_on = not (mode == 0 and brightness <= PayloadGenerator.OFF_BRIGHTNESS)
 
         ha_brightness = int(brightness * 255 / 100) if brightness > 0 else 0
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
@@ -26,17 +27,22 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
 from .ble_helpers import find_notify_char
 from .const import (
     DEFAULT_SPEED,
+    DISCONNECT_TIMEOUT,
     DOMAIN,
     EFFECT_DEFAULT_SPEEDS,
+    KEEPALIVE_INTERVAL,
     KNOWN_CHAR_UUIDS,
+    RECONNECT_TICKS,
     SPEED_SEND_INTERVAL,
 )
 from .payload_generator import CommandType, PayloadGenerator
@@ -110,9 +116,14 @@ class IstripLight(LightEntity, RestoreEntity):
         # Serializes connect/subscribe/join so a concurrent call can't race
         # ahead and send a command before the join handshake has completed.
         self._connect_lock = asyncio.Lock()
+        self._ticks_until_retry = 0
+        self._added = False
 
         mac = address.lower().replace(":", "")
         self._attr_unique_id = f"istrip_{mac}"
+        # Pinned: HA drops service calls to unavailable entities, which
+        # would lock out the only command that can recover the link.
+        self._attr_available = True
         self._attr_is_on = False
         self._attr_rgb_color = (255, 255, 255)
         self._attr_brightness = 255
@@ -288,7 +299,70 @@ class IstripLight(LightEntity, RestoreEntity):
             )
         )
 
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass,
+                self._async_keepalive,
+                timedelta(seconds=KEEPALIVE_INTERVAL),
+            )
+        )
+
+        self._added = True
+
         await self._ensure_connected()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the live BLE link state."""
+        return {"ble_connected": self._connected}
+
+    async def _async_keepalive(self, now: datetime | None = None) -> None:
+        """Hold the BLE link open, or retry it while it is down."""
+        if self._connect_lock.locked():
+            return
+
+        if self._connected and self._client and self._client.is_connected:
+            try:
+                await self._client.write_gatt_char(
+                    self._char_uuid,
+                    bytes.fromhex(self._pg.get_join_group_payload()),
+                    response=False,
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Keepalive write to %s failed", self._address)
+                self._set_connected(False)
+            return
+
+        if self._ticks_until_retry > 0:
+            self._ticks_until_retry -= 1
+            return
+
+        self._ticks_until_retry = RECONNECT_TICKS
+        await self._ensure_connected(background=True)
+
+    @callback
+    def _set_connected(self, connected: bool) -> None:
+        """Record the link state and publish it if it changed."""
+        if self._connected == connected:
+            return
+        self._connected = connected
+        if self._added:
+            self.async_write_ha_state()
+
+    @callback
+    def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """React to the device dropping the link."""
+        if not self._connected:
+            return
+        _LOGGER.warning(
+            "Lost the BLE link to %s. This lamp stops advertising once "
+            "disconnected, so reconnecting right now is the only chance "
+            "before a power cycle is needed",
+            self._address,
+        )
+        self._set_connected(False)
+        self._ticks_until_retry = 0
+        self.hass.async_create_task(self._ensure_connected(background=True))
 
     @callback
     def _async_device_seen(
@@ -309,12 +383,17 @@ class IstripLight(LightEntity, RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity is removed from Home Assistant."""
         await super().async_will_remove_from_hass()
+        self._added = False
         if self._speed_debouncer is not None:
             self._speed_debouncer.async_shutdown()
         await self._disconnect()
 
-    async def _ensure_connected(self) -> None:
-        """Ensure BLE connection is established and notifications are enabled."""
+    async def _ensure_connected(self, background: bool = False) -> None:
+        """Ensure BLE connection is established and notifications are enabled.
+
+        A background attempt is a keepalive retry, not a user command, and
+        logs at debug level so it cannot flood the log.
+        """
         async with self._connect_lock:
             if self._connected and self._client and self._client.is_connected:
                 return
@@ -335,13 +414,13 @@ class IstripLight(LightEntity, RestoreEntity):
                         "connect when it is next seen",
                         self._address,
                     )
-                    self._attr_available = False
                     return
 
                 self._client = await establish_connection(
                     BleakClientWithServiceCache,
                     ble_device,
                     self._attr_device_info["name"],
+                    disconnected_callback=self._on_disconnected,
                     max_attempts=3,
                 )
                 _LOGGER.debug("Connected to iStrip device at %s", self._address)
@@ -402,16 +481,15 @@ class IstripLight(LightEntity, RestoreEntity):
 
                 # Only mark connected once the join handshake has gone out,
                 # so a waiting caller never sends a command ahead of it.
-                self._connected = True
-                self._attr_available = True
+                self._set_connected(True)
 
             # Connection/discovery can fail in many BLE-stack-specific ways;
             # treat any of them as a failed connection attempt.
             except Exception:  # noqa: BLE001
-                _LOGGER.error("Failed to connect to device at %s", self._address)
-                self._connected = False
+                log = _LOGGER.debug if background else _LOGGER.error
+                log("Failed to connect to device at %s", self._address)
+                self._set_connected(False)
                 self._client = None
-                self._attr_available = False
 
     def _persist_char_uuid(self) -> None:
         """Store a runtime-discovered characteristic back on the config entry.
@@ -454,17 +532,22 @@ class IstripLight(LightEntity, RestoreEntity):
         return writable_uuids[0] if writable_uuids else None
 
     async def _disconnect(self) -> None:
-        """Disconnect from the BLE device."""
+        """Disconnect from the BLE device.
+
+        Timed out because a collapsed link can block here forever, under
+        _connect_lock, freezing the keepalive and every reconnect with it.
+        """
         if self._client:
             try:
                 if self._client.is_connected:
-                    await self._client.disconnect()
+                    async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                        await self._client.disconnect()
                 _LOGGER.debug("Disconnected from iStrip device at %s", self._address)
-            except Exception:  # noqa: BLE001 - disconnect can fail in many ways
-                _LOGGER.error("Error disconnecting from %s", self._address)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Error disconnecting from %s", self._address)
             finally:
                 self._client = None
-                self._connected = False
+                self._set_connected(False)
 
     def _handle_notification(self, sender: int, data: bytearray) -> None:
         """Handle BLE notification from device."""
@@ -523,7 +606,7 @@ class IstripLight(LightEntity, RestoreEntity):
             # specific errors; any of them means "retry the send".
             except Exception as err:  # noqa: BLE001
                 last_exc = err
-                self._connected = False
+                self._set_connected(False)
                 if attempt < retries:
                     _LOGGER.warning(
                         "Send attempt %d/%d to %s failed (%s), retrying in %.1fs",
@@ -538,4 +621,8 @@ class IstripLight(LightEntity, RestoreEntity):
         _LOGGER.error(
             "Failed to send BLE payload to %s after %d attempts", self._address, retries
         )
-        raise last_exc
+        raise HomeAssistantError(
+            f"Could not reach the iStrip+ lamp at {self._address}. This lamp "
+            "stops advertising over Bluetooth once its connection drops and "
+            "cannot be reached again until it is power-cycled."
+        ) from last_exc
